@@ -25,7 +25,7 @@ from datetime import datetime
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl.styles.stylesheet")
 
 # ─── PAGE CONFIG ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Dispatch Analysis Hub", layout="wide")
+st.set_page_config(page_title="Dispatch Supreme", layout="wide")
 
 # ─── GLOBAL STYLES ─────────────────────────────────────────────────────────────
 st.markdown("""
@@ -741,7 +741,7 @@ cache = load_cache()
 gmaps_client = googlemaps.Client(key=st.secrets["GOOGLE_API_KEY"])
 
 # Renamed the main title
-st.title("Dispatch Analysis Hub")
+st.title("Dispatch Supreme")
 
 # ─── SESSION STATE ──────────────────────────────────────────────────────────────
 if "run" not in st.session_state:
@@ -977,7 +977,7 @@ if st.session_state.run and not show_geocode_button:
 
     # ...existing code...
 
-    with st.expander("� Route-Based Delivery Map", expanded=False):
+    with st.expander("🗺️ Route-Based Delivery Map", expanded=False):
         st.markdown("### Route-Based Delivery Trajectories by Date")
         st.markdown("This map shows deliveries grouped by Route column, with each route representing a driver trajectory.")
         
@@ -1133,6 +1133,69 @@ if st.session_state.run and not show_geocode_button:
                 # Sort the detailed data by Drivers and Priority for consistent display
                 detailed_dispatch_data = detailed_dispatch_data.sort_values(["Drivers", "Priority", "Name"]).reset_index(drop=True)
                 
+                # AUTOMATIC ROUTE OPTIMIZATION - Run once on initial load for all drivers
+                if "optimized_dispatch_data" not in st.session_state and whs in WAREHOUSE_COORDS:
+                    warehouse_coords = [WAREHOUSE_COORDS[whs]["lat"], WAREHOUSE_COORDS[whs]["lon"]]
+                    optimized_data_list = []
+                    
+                    for driver_num in detailed_dispatch_data["Drivers"].unique():
+                        driver_data = detailed_dispatch_data[detailed_dispatch_data["Drivers"] == driver_num].copy()
+                        
+                        if not driver_data.empty:
+                            # Optimize this driver's route
+                            optimized_driver_data = optimize_delivery_order(driver_data, warehouse_coords)
+                            optimized_driver_data = optimized_driver_data.reset_index(drop=True)
+                            
+                            # Build unique company list in the order they first appear in optimized route
+                            unique_companies_in_order = []
+                            for _, row in optimized_driver_data.iterrows():
+                                company_name = normalize_customer_name(row["Name"])
+                                if company_name not in unique_companies_in_order:
+                                    unique_companies_in_order.append(company_name)
+                            
+                            # Create fresh priority mapping: each unique company gets unique priority
+                            company_priority_map = {company: idx + 1 for idx, company in enumerate(unique_companies_in_order)}
+                            
+                            # Assign priorities to optimized data
+                            optimized_driver_data["Priority"] = optimized_driver_data["Name"].apply(
+                                lambda name: company_priority_map[normalize_customer_name(name)]
+                            )
+                            
+                            optimized_data_list.append(optimized_driver_data)
+                    
+                    if optimized_data_list:
+                        optimized_full_data = pd.concat(optimized_data_list, ignore_index=True)
+                        detailed_dispatch_data_reset = detailed_dispatch_data.copy()
+                        
+                        # Update ALL rows for each driver with correct optimized priorities
+                        for driver_num in detailed_dispatch_data["Drivers"].unique():
+                            driver_optimized_data = optimized_full_data[optimized_full_data["Drivers"] == driver_num].copy()
+                            
+                            if not driver_optimized_data.empty:
+                                driver_optimized_data = driver_optimized_data.reset_index(drop=True)
+                                
+                                # Build unique company list in the order they first appear in optimized route
+                                unique_companies_in_order = []
+                                for _, row in driver_optimized_data.iterrows():
+                                    company_name = normalize_customer_name(row["Name"])
+                                    if company_name not in unique_companies_in_order:
+                                        unique_companies_in_order.append(company_name)
+                                
+                                # Create fresh priority mapping: each unique company gets unique priority
+                                company_priority_map = {company: idx + 1 for idx, company in enumerate(unique_companies_in_order)}
+                                
+                                # Update ALL rows in detailed_dispatch_data for this driver with correct priorities
+                                for company_name, priority in company_priority_map.items():
+                                    company_mask = (
+                                        (detailed_dispatch_data_reset["Drivers"] == driver_num) &
+                                        (detailed_dispatch_data_reset["Name"].apply(normalize_customer_name) == company_name)
+                                    )
+                                    detailed_dispatch_data_reset.loc[company_mask, "Priority"] = priority
+                        
+                        # Store optimized data in session state
+                        st.session_state.optimized_dispatch_data = detailed_dispatch_data_reset
+                        detailed_dispatch_data = detailed_dispatch_data_reset
+                
                 # Get the max driver number for dropdown options (include bulk deliveries)
                 current_max_driver = detailed_dispatch_data["Drivers"].max() if not detailed_dispatch_data.empty else 1
                 max_driver_num = max(int(current_max_driver), 10)
@@ -1140,7 +1203,7 @@ if st.session_state.run and not show_geocode_button:
                 # Display editable table for driver assignments
                 st.markdown("### Assign Drivers and View Details")
                 st.markdown("Edit the Driver numbers below and the map will update accordingly")
-                st.info("🚛 **Route Optimization:** Driver trajectories use real road networks with optimized delivery order for efficient truck routing.")
+                st.info("🚛 **Route Optimization:** Driver routes are automatically optimized using real road networks for efficient delivery sequencing.")
                 
                 # Use optimized data if available, otherwise use regular detailed_dispatch_data
                 data_for_editor = detailed_dispatch_data
@@ -1319,91 +1382,6 @@ if st.session_state.run and not show_geocode_button:
                 # Debug: Show selected drivers count
                 if selected_drivers:
                     st.caption(f"✓ {len(selected_drivers)} driver(s) selected: {', '.join([f'Driver {d}' for d in sorted(selected_drivers)])}")
-                
-                # Add Re-optimize Route button for selected drivers
-                if selected_drivers:
-                    st.markdown("---")
-                    col_optimize, col_optimize_info = st.columns([1, 3])
-                    with col_optimize:
-                        if st.button("🚛 Re-optimize Routes", help="Recalculate optimal delivery sequence for selected drivers"):
-                            # Re-optimize routes for selected drivers only
-                            if whs in WAREHOUSE_COORDS:
-                                warehouse_coords = [WAREHOUSE_COORDS[whs]["lat"], WAREHOUSE_COORDS[whs]["lon"]]
-                                
-                                # Get current data with coordinates
-                                current_data_with_coords = route_date_data.copy()
-                                current_data_with_coords["Drivers"] = driver_assignments.values
-                                
-                                optimized_data_list = []
-                                
-                                for driver_num in unique_drivers:
-                                    driver_data = current_data_with_coords[current_data_with_coords["Drivers"] == driver_num].copy()
-                                    
-                                    if driver_num in selected_drivers and not driver_data.empty:
-                                        # Re-optimize this selected driver
-                                        optimized_driver_data = optimize_delivery_order(driver_data, warehouse_coords)
-                                        optimized_driver_data = optimized_driver_data.reset_index(drop=True)
-                                        
-                                        # Reassign priorities based on optimized order
-                                        # First pass: identify all unique customers and assign them priority numbers
-                                        unique_customers = []
-                                        for idx, row in optimized_driver_data.iterrows():
-                                            company_name = normalize_customer_name(row["Name"])
-                                            if company_name not in unique_customers:
-                                                unique_customers.append(company_name)
-                                        
-                                        # Create priority mapping for all customers
-                                        company_priority = {customer: i + 1 for i, customer in enumerate(unique_customers)}
-                                        
-                                        # Second pass: assign priorities to all rows based on customer
-                                        for idx, row in optimized_driver_data.iterrows():
-                                            company_name = normalize_customer_name(row["Name"])
-                                            optimized_driver_data.loc[idx, "Priority"] = company_priority[company_name]
-                                        
-                                        optimized_data_list.append(optimized_driver_data)
-                                    else:
-                                        # Keep unselected drivers as-is
-                                        # Create a mask for this driver's data
-                                        driver_mask = current_data_with_coords["Drivers"] == driver_num
-                                        driver_indices = current_data_with_coords[driver_mask].index
-                                        
-                                        # Get corresponding priorities for this driver
-                                        driver_priorities = []
-                                        for idx in driver_indices:
-                                            if idx < len(priority_assignments):
-                                                driver_priorities.append(priority_assignments.iloc[idx])
-                                            else:
-                                                driver_priorities.append(1)  # fallback
-                                        
-                                        # Assign priorities to driver data
-                                        driver_data = driver_data.reset_index(drop=True)
-                                        driver_data["Priority"] = driver_priorities[:len(driver_data)]
-                                        optimized_data_list.append(driver_data)
-                                
-                                if optimized_data_list:
-                                    # Update the detailed_dispatch_data with new priorities
-                                    optimized_full_data = pd.concat(optimized_data_list, ignore_index=True)
-                                    
-                                    # Force update of the original data source with optimized priorities
-                                    # We need to update the source data that feeds the data editor
-                                    detailed_dispatch_data_reset = detailed_dispatch_data.copy()
-                                    for idx, row in optimized_full_data.iterrows():
-                                        if idx < len(detailed_dispatch_data_reset):
-                                            detailed_dispatch_data_reset.loc[idx, "Priority"] = row["Priority"]
-                                    
-                                    # Store optimized data in session state to persist across reruns
-                                    st.session_state.optimized_dispatch_data = detailed_dispatch_data_reset
-                                    
-                                    # Clear the data editor cache by incrementing a counter
-                                    if "optimization_counter" not in st.session_state:
-                                        st.session_state.optimization_counter = 0
-                                    st.session_state.optimization_counter += 1
-                                    
-                                    st.success(f"✅ Routes re-optimized for Driver(s): {', '.join(map(str, selected_drivers))}. Priorities updated!")
-                                    st.rerun()
-                            
-                    with col_optimize_info:
-                        st.info("🎯 This will recalculate the most efficient delivery sequence for the selected drivers based on geographical proximity.")
                 
                 # Create color mapping for drivers (supports up to 15 unique drivers)
                 driver_colors = [
@@ -1709,10 +1687,14 @@ if st.session_state.run and not show_geocode_button:
                     driver_num = int(driver_name.replace("Driver ", ""))
                     if driver_num not in selected_drivers:
                         continue
+                    # Calculate total time same as driver summary table (Travel Time + Stop Time)
+                    adjusted_travel_time = stats["travel_time_minutes"] * travel_time_coefficient
+                    stop_time = stats["customers"] * minutes_per_stop
+                    total_time = adjusted_travel_time + stop_time
                     legend_html += (
                         f'<div style="margin:2px 0;">'
                         f'<span style="background-color:{stats["color"]};color:white;padding:2px 6px;border-radius:3px;font-size:11px;font-weight:bold;margin-right:5px;">{sanitize_for_html(driver_name)}</span>'
-                        f'<span style="font-size:11px;">{stats["deliveries"]} del | {stats["customers"]} cust | {stats["total_weight"]:,.0f} lbs | {stats["total_miles"]:.1f} mi | {format_travel_time(stats["travel_time_minutes"])}</span>'
+                        f'<span style="font-size:11px;">{stats["deliveries"]} del | {stats["customers"]} cust | {stats["total_weight"]:,.0f} lbs | {stats["total_miles"]:.1f} mi | {format_travel_time(total_time)}</span>'
                         f'</div>'
                     )
                 
@@ -1804,7 +1786,7 @@ if st.session_state.run and not show_geocode_button:
         else:
             st.info("Please select a date to view driver-based delivery map")
 
-    with st.expander("�🚚 Add Planned Driving Trajectories", expanded=False):
+    with st.expander("🚚 Add Planned Driving Trajectories", expanded=False):
 
         st.markdown('<div style="font-weight: bold; font-size: 18px;">Upload Driver and Trajectory File</div>', unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)  # Add space above radio buttons
@@ -2397,7 +2379,7 @@ if st.session_state.run and not show_geocode_button:
                         st.warning(msg)
                 st.rerun()
 
-    with st.expander("🗺️ Delivery Map", expanded=True):
+    with st.expander("🗺️ Delivery Map", expanded=False):
         # Exclude the selected Dispatch Date and any dates before it from the Map Date Filter options
         # Handle both Paste Table and Upload Excel modes
         dispatch_date_str = None
